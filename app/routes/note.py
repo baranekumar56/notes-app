@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from typing import List, Optional
 from app.schema.note import NoteCreate, Note, ContentCreate, Content
 from app.schema.workspace import Collab
@@ -27,7 +27,7 @@ async def create_note(note: NoteCreate, current_user: dict = Depends(get_current
         )
     
     # Verify that the workspace exists and user has access
-    workspace = workspaces.find_one({
+    workspace = await workspaces.find_one({
         'workspace_id': note.workspace_id,
         'user_id': current_user['user_id']  # or check in collabs collection
     })
@@ -41,8 +41,8 @@ async def create_note(note: NoteCreate, current_user: dict = Depends(get_current
     note_data = note.model_dump()
     note_data['user_id'] = current_user['user_id']  # Ensure note is created by current user
     
-    inserted_note = notes.insert_one(note_data)
-    created_note = notes.find_one({'_id': inserted_note.inserted_id})
+    inserted_note = await notes.insert_one(note_data)
+    created_note = await notes.find_one({'_id': inserted_note.inserted_id})
     created_note['note_id'] = str(created_note['_id'])
     del created_note['_id']
     
@@ -64,7 +64,7 @@ async def get_notes_of_workspace(
         )
     
     # Verify workspace access
-    workspace = workspaces.find_one({
+    workspace = await workspaces.find_one({
         'workspace_id': workspace_id,
         'user_id': current_user['user_id']  # or check collabs
     })
@@ -75,7 +75,8 @@ async def get_notes_of_workspace(
             detail="Workspace not found or access denied"
         )
     
-    notes_list = list(notes.find({'workspace_id': workspace_id}))
+    cursor = notes.find({'workspace_id': workspace_id})
+    notes_list = await cursor.to_list(length=None)
     
     for note in notes_list:
         note['note_id'] = str(note['_id'])
@@ -98,7 +99,7 @@ async def get_note(
             detail="Read access required to view note"
         )
     
-    note = notes.find_one({'_id': ObjectId(note_id)})
+    note = await notes.find_one({'_id': ObjectId(note_id)})
     
     if not note:
         raise HTTPException(
@@ -107,7 +108,7 @@ async def get_note(
         )
     
     # Verify user has access to the workspace containing this note
-    workspace = workspaces.find_one({
+    workspace = await workspaces.find_one({
         'workspace_id': note['workspace_id'],
         'user_id': current_user['user_id']  # or check collabs
     })
@@ -126,11 +127,11 @@ async def get_note(
 @router.put('/{note_id}', response_model=Note)
 async def update_note(
     note_id: str,
-    note_update: dict,  # You might want to create an UpdateNote schema
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Update note header/metadata
+    Update note contents by replacing all sections
     Requires: 'rw' access
     """
     if current_user['access'] not in ['rw']:
@@ -139,7 +140,7 @@ async def update_note(
             detail="Write access required to update notes"
         )
     
-    note = notes.find_one({'_id': ObjectId(note_id)})
+    note = await notes.find_one({'_id': ObjectId(note_id)})
     
     if not note:
         raise HTTPException(
@@ -154,15 +155,20 @@ async def update_note(
             detail="Only note owner can update note metadata"
         )
     
-    # Remove None values from update
-    update_data = {k: v for k, v in note_update.items() if v is not None}
+    # Get the request data
+    data = await request.json()
+    sections = data.get('sections', [])
     
-    notes.update_one(
-        {'_id': ObjectId(note_id)},
-        {'$set': update_data}
-    )
+    # Delete existing contents for this note
+    await contents.delete_many({"note_id": note_id})
     
-    updated_note = notes.find_one({'_id': ObjectId(note_id)})
+    # Insert new sections
+    for section_data in sections:
+        section_data['note_id'] = note_id
+        await contents.insert_one(section_data)
+    
+    # Return the updated note
+    updated_note = await notes.find_one({'_id': ObjectId(note_id)})
     updated_note['note_id'] = str(updated_note['_id'])
     del updated_note['_id']
     
@@ -183,7 +189,7 @@ async def delete_note(
             detail="Write access required to delete notes"
         )
     
-    note = notes.find_one({'_id': ObjectId(note_id)})
+    note = await notes.find_one({'_id': ObjectId(note_id)})
     
     if not note:
         raise HTTPException(
@@ -199,8 +205,8 @@ async def delete_note(
         )
     
     # Delete the note and all its contents
-    notes.delete_one({'_id': ObjectId(note_id)})
-    contents.delete_many({'note_id': note_id})
+    await notes.delete_one({'_id': ObjectId(note_id)})
+    await contents.delete_many({'note_id': note_id})
     
     return {"message": "Note deleted successfully"}
 
@@ -220,7 +226,7 @@ async def add_content_to_note(
             detail="Write access required to add content"
         )
     
-    note = notes.find_one({'_id': ObjectId(note_id)})
+    note = await notes.find_one({'_id': ObjectId(note_id)})
     
     if not note:
         raise HTTPException(
@@ -229,7 +235,7 @@ async def add_content_to_note(
         )
     
     # Verify user has access to modify this note
-    workspace = workspaces.find_one({
+    workspace = await workspaces.find_one({
         'workspace_id': note['workspace_id'],
         'user_id': current_user['user_id']  # or check collabs
     })
@@ -243,8 +249,8 @@ async def add_content_to_note(
     content_data = content.model_dump()
     content_data['note_id'] = note_id
     
-    inserted_content = contents.insert_one(content_data)
-    created_content = contents.find_one({'_id': inserted_content.inserted_id})
+    inserted_content = await contents.insert_one(content_data)
+    created_content = await contents.find_one({'_id': inserted_content.inserted_id})
     created_content['content_id'] = str(created_content['_id'])
     del created_content['_id']
     
@@ -265,7 +271,7 @@ async def get_note_contents(
             detail="Read access required to view note contents"
         )
     
-    note = notes.find_one({'_id': ObjectId(note_id)})
+    note = await notes.find_one({'_id': ObjectId(note_id)})
     
     if not note:
         raise HTTPException(
@@ -274,7 +280,7 @@ async def get_note_contents(
         )
     
     # Verify user has access to the workspace
-    workspace = workspaces.find_one({
+    workspace = await workspaces.find_one({
         'workspace_id': note['workspace_id'],
         'user_id': current_user['user_id']  # or check collabs
     })
@@ -285,7 +291,8 @@ async def get_note_contents(
             detail="Access denied to this note"
         )
     
-    contents_list = list(contents.find({'note_id': note_id}).sort('section_no', 1))
+    cursor = contents.find({'note_id': note_id}).sort('section_no', 1)
+    contents_list = await cursor.to_list(length=None)
     
     for content in contents_list:
         content['content_id'] = str(content['_id'])
@@ -298,7 +305,8 @@ async def get_user_notes(current_user: dict = Depends(get_current_user)):
     """
     Get all notes created by the current user across all workspaces
     """
-    user_notes = list(notes.find({'user_id': current_user['user_id']}))
+    cursor = notes.find({'user_id': current_user['user_id']})
+    user_notes = await cursor.to_list(length=None)
     
     for note in user_notes:
         note['note_id'] = str(note['_id'])
